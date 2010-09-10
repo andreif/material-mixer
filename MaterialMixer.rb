@@ -36,7 +36,7 @@ class MaterialMixer
     self.parse NATURAL_COMPOSITIONS, :natural # old way: self.load_natural_compositions
     self.parse LIBRARY_COMPOSITIONS, :library
     self.parse text_with_mixes, :user_defined unless text_with_mixes.nil?
-    @mixes.values.each {|mix| mix.inherit_properties}
+    yield self if block_given?
   end
   
   
@@ -101,7 +101,7 @@ class MaterialMixer
       end
     end
     missing.each_pair do |element,nuclides|
-      raise "Element is missing #{element} completely" unless found[ element ]
+      raise "Element #{element} is missing completely" unless found[ element ]
     end
     found.each_pair do |element,nuclides|
       if missing[element]
@@ -114,13 +114,16 @@ class MaterialMixer
         #modified[element] = {updated: found[element].keys, removed: missing[element].keys}
       end
     end
-    return modified
+    return modified, mix_nuclides
   end
+  
+  
   
   def stat_xs_params mix_nuclides, mix_temperature
     stats = {}
     unless @xsdata.nil? or @xsdata.data.empty?
       mix_nuclides.keys.each do |nuclide|
+#p nuclide.zaid
         if xs = self.xs_key(nuclide.zaid, mix_temperature)
           [:temperature_MeV,:key,:library].each do |p|
             stats[p] ||= Hash.new(0)
@@ -131,7 +134,7 @@ class MaterialMixer
       by_value = Proc.new {|a,b| a.last <=> b.last}
       [:temperature_MeV,:key,:library].each do |p|
         value,count = stats[p].sort(&by_value).last
-        stats[p] = count > 1 ? value : nil
+        stats[p] = (count > 1 or mix_nuclides.count < 2) ? value : nil
       end
     end
     return stats
@@ -146,7 +149,7 @@ class MaterialMixer
   def print_for_serpent *mixnames; self.print_for :serpent, *mixnames end
   def print_for code, *mixnames
     mixnames = self.printable_mixnames if mixnames.empty?
-    return mixnames.collect { |mixname| self.print self.get(mix: mixname), code if @mixes.has_key? mixname }.join
+    return mixnames.collect { |mixname| self.print self.get(mix: mixname), code if @mixes.has_key? mixname.to_s }.join
   end
   
   
@@ -163,9 +166,13 @@ class MaterialMixer
   end
   
   
+  
+  
   def print mix, code= :mcnp
     r = ''
+#p mix.name
     stats = self.stat_xs_params mix.nuclides, mix.temperature
+#p stats
     @mat_count ||= 0
     case code
       when :mcnp
@@ -194,29 +201,30 @@ class MaterialMixer
       ]
     end
     r += "\n"
+    elements = mix.elements
     mix.stat_compounds.merge(mix.elements).each_pair do |element,fractions|
       r += "#{c} %-3s %s at%%, %s wt%%, %6.2f u" % [
         element,
         self.fmt('%7.3f', 100*fractions[:atomic]),
         self.fmt('%7.3f', 100*fractions[:mass]),
-        self.get(element).average_atomic_mass
+        self.get(element).average_atomic_mass(fractions[:nuclides])
       ]
       r += ", %.4e /b/cm" % (mix.atomic_density * fractions[:atomic]) unless mix.density.nil? or mix.density.zero?
       r += "\n"
     end
     nuclides = mix.nuclides # do not move it
-    modified = self.correct_missing_nuclides! nuclides, mix.temperature # careful, it modifies nuclides!
+    modified, nuclides = self.correct_missing_nuclides! nuclides, mix.temperature # careful, it modifies nuclides!
     nuclides.each_pair do |nuclide,fractions|
       if xs = self.xs_key(nuclide.zaid, mix.temperature)
         r += "%s%6s%-4s   %s #{ic} %-7s %8.5f wt%%, %6.2f u, %s at%% in %-2s" % [
-          ' '*5,
+          {mcnp:' '*5}[code],
           nuclide.zaid,
           (stats[:key].nil? or xs[:key] == stats[:key]) && (code== :mcnp) ? nil : '.'+xs[:key].to_s,
           self.fmt('%17.14f', 100*fractions[:atomic]),
           nuclide.name,
           100*fractions[:mass],
           nuclide.average_atomic_mass,
-          self.fmt('%7.3f', 100*self.get(mix: nuclide.symbol).fraction_of(nuclide.name,:atomic)),
+          self.fmt('%7.3f', 100*elements[nuclide.symbol][:nuclides][nuclide][:atomic]/elements[nuclide.symbol][:atomic]),
           nuclide.symbol
         ]
         r += ", %.4e /b/cm" % (mix.atomic_density * fractions[:atomic]) unless mix.density.nil? or mix.density.zero?
@@ -256,7 +264,7 @@ class MaterialMixer
       parameters = {}
       words.select { |word| word =~ /=/ }.each do |keyvalue|
         key,value = keyvalue.split('=')
-        key = {'t'=>:temperature,'d'=>:density}[key.downcase!] || key.to_sym
+        key = {'t'=>:temperature,'d'=>:density}[key.downcase] || key.downcase.to_sym
         parameters[key] = value
       end
       words = words.delete_if { |word| word =~ /=/ }
@@ -307,25 +315,26 @@ class MaterialMixer
         end
       end
     end
+    @mixes.values.each {|mix| mix.inherit_properties}
   end
   
   
-  def load_natural_compositions
-    NATURAL_COMPOSITIONS.strip.split("\n").each do |line|
-      element_symbol, mass_number, af = line.split # skip half-lifes
-      
-      nuclide = self.get nuclide: (element_symbol + mass_number)
-      
-      self.get(mix: element_symbol) do |mix|
-        mix.add_compound(nuclide).fraction atomic: af.to_f
-        mix.mark_as_natural
-      end
-      
-    end
-    @mixes.values.each do |mix| 
-      mix.normalize_fractions
-    end
-  end
+  # def load_natural_compositions
+  #   NATURAL_COMPOSITIONS.strip.split("\n").each do |line|
+  #     element_symbol, mass_number, af = line.split # skip half-lifes
+  #     
+  #     nuclide = self.get nuclide: (element_symbol + mass_number)
+  #     
+  #     self.get(mix: element_symbol) do |mix|
+  #       mix.add_compound(nuclide).fraction atomic: af.to_f
+  #       mix.mark_as_natural
+  #     end
+  #     
+  #   end
+  #   @mixes.values.each do |mix| 
+  #     mix.normalize_fractions
+  #   end
+  # end
   
   def load_library args
     text = IO.read args[:path] unless args[:path].nil?
@@ -352,7 +361,7 @@ class MaterialMixer
       temperature_match = (t0 - t1).abs < 20
       library_match = @xslib.nil? || (xs[:library] =~ @xslib)
 
-#p match: [temperature_match, library_match, xs[:library], @xslib]
+#p match: [temperature_match, library_match, xs[:library], @xslib] if zaid == '82000'
       
       if temperature_match and library_match # exact match
         return xs
@@ -493,6 +502,10 @@ class MaterialMixer
       self.reset :undefined
     end
     
+    def mev
+      @mev ||= @mixer.stat_xs_params(self.nuclides, @temperature)[:temperature_MeV]
+    end
+    
     def reset group
       @compounds = {}
       @group = group
@@ -534,11 +547,20 @@ class MaterialMixer
     end
 
 
-    def average_atomic_mass
+    def average_atomic_mass nuclides=nil
+      af_sum = 0
+      unless nuclides.nil? # mass by list not mix compounds - do not save it!!!
+        mass = 0
+#p nuclides
+        nuclides.each_pair do |name,fractions|
+          mass += fractions[:atomic] * @mixer.get(nuclide: name).average_atomic_mass
+          af_sum += fractions[:atomic]
+        end
+        return mass / af_sum
+      end
       raise "Mix '#{@name}' has no compounds" if @compounds.empty?
       return @average_atomic_mass unless @average_atomic_mass.nil? # just to save some time instead of recalculating trees
       @average_atomic_mass = 0
-      af_sum = 0
       self.normalize_fractions
       @compounds.values.each do |c|
         @average_atomic_mass += c.fraction(:atomic) * c.average_atomic_mass
@@ -591,6 +613,15 @@ class MaterialMixer
         [:atomic,:mass].each do |type|
           sums[ nuclide.symbol ][type] ||= 0
           sums[ nuclide.symbol ][type] += fractions[type]
+          sums[ nuclide.symbol ][:nuclides] ||= {}
+          sums[ nuclide.symbol ][:nuclides][nuclide] = fractions
+        end
+      end
+      sums.each_pair do |element_name, element_fractions|
+        element_fractions[:nuclides].each_pair do |nuclide, nuclide_fractions|
+          [:atomic,:mass].each do |type|
+            nuclide_fractions[type] /= element_fractions[type]
+          end
         end
       end
       return sums
